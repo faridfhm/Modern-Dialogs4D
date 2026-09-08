@@ -27,6 +27,33 @@ type
     BiDiMode: TBiDiMode;
   end;
 
+  { Values left empty here inherit from CustomBaseLanguage when Language is
+    dlCustom.  This persistent object is intentionally owned by
+    TModernDialogs and is suitable for nested Object Inspector editing. }
+  TDialogCustomTranslation = class(TPersistent)
+  private
+    FTitleInfo, FTitleSuccess, FTitleWarning, FTitleError: string;
+    FTitleConfirm, FTitleNotify, FTitleInput: string;
+    FBtnOk, FBtnClose, FBtnYes, FBtnNo, FBtnCancel: string;
+    FCountdownFmt: string;
+  public
+    procedure Assign(Source: TPersistent); override;
+  published
+    property TitleInfo: string read FTitleInfo write FTitleInfo;
+    property TitleSuccess: string read FTitleSuccess write FTitleSuccess;
+    property TitleWarning: string read FTitleWarning write FTitleWarning;
+    property TitleError: string read FTitleError write FTitleError;
+    property TitleConfirm: string read FTitleConfirm write FTitleConfirm;
+    property TitleNotify: string read FTitleNotify write FTitleNotify;
+    property TitleInput: string read FTitleInput write FTitleInput;
+    property BtnOk: string read FBtnOk write FBtnOk;
+    property BtnClose: string read FBtnClose write FBtnClose;
+    property BtnYes: string read FBtnYes write FBtnYes;
+    property BtnNo: string read FBtnNo write FBtnNo;
+    property BtnCancel: string read FBtnCancel write FBtnCancel;
+    property CountdownFmt: string read FCountdownFmt write FCountdownFmt;
+  end;
+
 const
   TRANSLATIONS: array[TDialogLanguage] of TDialogTranslation = (
     (TitleInfo: 'Information'; TitleSuccess: 'Success'; TitleWarning: 'Warning';
@@ -86,11 +113,15 @@ type
     FBackgroundColor: TColor;
     FLanguage: TDialogLanguage;
     FBiDiMode: TBiDiMode;
+    FCustomBaseLanguage: TDialogLanguage;
+    FCustomTranslation: TDialogCustomTranslation;
     FInfoStyle, FSuccessStyle, FWarningStyle, FErrorStyle, FQuestionStyle, FInputStyle: TAppMessageItemStyle;
     procedure SetFont(const Value: TFont);
     procedure SetBackgroundColor(const Value: TColor);
     procedure SetLanguage(const Value: TDialogLanguage);
     procedure SetBiDiMode(const Value: TBiDiMode);
+    procedure SetCustomBaseLanguage(const Value: TDialogLanguage);
+    procedure SetCustomTranslation(const Value: TDialogCustomTranslation);
     procedure SetInfoStyle(const Value: TAppMessageItemStyle);
     procedure SetSuccessStyle(const Value: TAppMessageItemStyle);
     procedure SetWarningStyle(const Value: TAppMessageItemStyle);
@@ -110,6 +141,10 @@ type
     procedure Error(const Msg: string; const ATitle: string = '');
     function Confirm(const Msg: string; const ATitle: string = ''; ADefaultToNo: Boolean = False): Boolean;
     function InputBox(const ATitle, APrompt: string; const ADefault: string = ''): string;
+    { Returns True only when the first (OK/Yes) input button is accepted.
+      On False, AValue is left unchanged; on True it contains the accepted
+      value, including an intentionally empty string. }
+    function TryInputBox(const ATitle, APrompt: string; var AValue: string): Boolean;
     procedure ShowNotification(const Msg: string; TimeoutMs: Integer = 3000);
     procedure ShowToast(const Msg: string; AType: TAppMessageType = mtSuccess; TimeoutMs: Integer = 3000);
 
@@ -117,6 +152,13 @@ type
     property Font: TFont read FFont write SetFont;
     property BackgroundColor: TColor read FBackgroundColor write SetBackgroundColor default clWhite;
     property Language: TDialogLanguage read FLanguage write SetLanguage default dlEnglish;
+    { Empty custom fields inherit from this fallback language. dlCustom is
+      normalized to dlEnglish. Explicit BiDiMode remains independent. }
+    property CustomBaseLanguage: TDialogLanguage read FCustomBaseLanguage
+      write SetCustomBaseLanguage default dlEnglish;
+    property CustomTranslation: TDialogCustomTranslation read FCustomTranslation
+      write SetCustomTranslation;
+    { Explicit changes affect layout direction but do not change Language. }
     property BiDiMode: TBiDiMode read FBiDiMode write SetBiDiMode default bdLeftToRight;
     property StyleInfo: TAppMessageItemStyle read FInfoStyle write SetInfoStyle;
     property StyleSuccess: TAppMessageItemStyle read FSuccessStyle write SetSuccessStyle;
@@ -173,7 +215,7 @@ type
     FTotalMs, FElapsedMs, FLastSec: Integer;
     FButtons: array of TFlatButton;
     FBtnCount: Integer;
-    FIsRTL, FIsInput: Boolean;
+    FIsRTL, FIsInput, FIsToast: Boolean;
     FInputResult: string;
 
     procedure BuildUI;
@@ -239,13 +281,59 @@ begin
   Result := TColor(RGB(EnsureRange(NewR, 0, 255), EnsureRange(NewG, 0, 255), EnsureRange(NewB, 0, 255)));
 end;
 
-function CalcTextHeight(ACanvas: TCanvas; const AText: string; AWidth: Integer; AFont: TFont): Integer;
-var R: TRect;
+function CalcTextHeight(ACanvas: TCanvas; const AText: string; AWidth: Integer;
+  AFont: TFont; AIsRTL: Boolean): Integer;
+var
+  R: TRect;
+  DrawFlags: Cardinal;
 begin
   ACanvas.Font.Assign(AFont);
-  R := Rect(0, 0, AWidth, 0);
-  DrawText(ACanvas.Handle, PChar(AText), Length(AText), R, DT_CALCRECT or DT_WORDBREAK or DT_NOPREFIX);
+  { Use the actual target font and never pass a zero wrapping width. }
+  R := Rect(0, 0, Max(1, AWidth), 0);
+  DrawFlags := DT_CALCRECT or DT_WORDBREAK or DT_NOPREFIX;
+  if AIsRTL then
+    DrawFlags := DrawFlags or DT_RTLREADING;
+  DrawText(ACanvas.Handle, PChar(AText), Length(AText), R, DrawFlags);
   Result := Max(18, R.Bottom - R.Top);
+end;
+
+function IsValidCountdownFormat(const AFormat: string): Boolean;
+begin
+  Result := False;
+  if Trim(AFormat) = '' then
+    Exit;
+  try
+    { The countdown always supplies exactly one integer argument. }
+    Format(AFormat, [0]);
+    Result := True;
+  except
+    on E: Exception do
+      Result := False;
+  end;
+end;
+
+{ TDialogCustomTranslation }
+
+procedure TDialogCustomTranslation.Assign(Source: TPersistent);
+begin
+  if Source is TDialogCustomTranslation then
+  begin
+    FTitleInfo := TDialogCustomTranslation(Source).FTitleInfo;
+    FTitleSuccess := TDialogCustomTranslation(Source).FTitleSuccess;
+    FTitleWarning := TDialogCustomTranslation(Source).FTitleWarning;
+    FTitleError := TDialogCustomTranslation(Source).FTitleError;
+    FTitleConfirm := TDialogCustomTranslation(Source).FTitleConfirm;
+    FTitleNotify := TDialogCustomTranslation(Source).FTitleNotify;
+    FTitleInput := TDialogCustomTranslation(Source).FTitleInput;
+    FBtnOk := TDialogCustomTranslation(Source).FBtnOk;
+    FBtnClose := TDialogCustomTranslation(Source).FBtnClose;
+    FBtnYes := TDialogCustomTranslation(Source).FBtnYes;
+    FBtnNo := TDialogCustomTranslation(Source).FBtnNo;
+    FBtnCancel := TDialogCustomTranslation(Source).FBtnCancel;
+    FCountdownFmt := TDialogCustomTranslation(Source).FCountdownFmt;
+  end
+  else
+    inherited;
 end;
 
 { TAppMessageItemStyle }
@@ -283,6 +371,8 @@ begin
   FBackgroundColor := clWhite;
   FLanguage := dlEnglish;
   FBiDiMode := bdLeftToRight;
+  FCustomBaseLanguage := dlEnglish;
+  FCustomTranslation := TDialogCustomTranslation.Create;
 
   FFont := TFont.Create;
   if (Screen <> nil) and (Screen.MessageFont.Name <> '') then
@@ -332,6 +422,7 @@ end;
 destructor TModernDialogs.Destroy;
 begin
   FFont.Free;
+  FCustomTranslation.Free;
   FInfoStyle.Free;
   FSuccessStyle.Free;
   FWarningStyle.Free;
@@ -349,6 +440,8 @@ begin
   if FLanguage <> Value then
   begin
     FLanguage := Value;
+    { Built-in languages provide their conventional direction. Custom
+      language direction is controlled by the independent BiDiMode property. }
     if FLanguage <> dlCustom then
       FBiDiMode := TRANSLATIONS[FLanguage].BiDiMode;
   end;
@@ -356,11 +449,24 @@ end;
 
 procedure TModernDialogs.SetBiDiMode(const Value: TBiDiMode);
 begin
+  { An explicit direction is a presentation choice, not a language change. }
   if FBiDiMode <> Value then
-  begin
     FBiDiMode := Value;
-    FLanguage := dlCustom;
-  end;
+end;
+
+procedure TModernDialogs.SetCustomBaseLanguage(const Value: TDialogLanguage);
+begin
+  { dlCustom cannot be a fallback array index; normalize it deterministically. }
+  if Value = dlCustom then
+    FCustomBaseLanguage := dlEnglish
+  else
+    FCustomBaseLanguage := Value;
+end;
+
+procedure TModernDialogs.SetCustomTranslation(const Value: TDialogCustomTranslation);
+begin
+  if Assigned(Value) and (Value <> FCustomTranslation) then
+    FCustomTranslation.Assign(Value);
 end;
 
 procedure TModernDialogs.SetInfoStyle(const Value: TAppMessageItemStyle); begin FInfoStyle.Assign(Value); end;
@@ -370,7 +476,43 @@ procedure TModernDialogs.SetErrorStyle(const Value: TAppMessageItemStyle); begin
 procedure TModernDialogs.SetQuestionStyle(const Value: TAppMessageItemStyle); begin FQuestionStyle.Assign(Value); end;
 procedure TModernDialogs.SetInputStyle(const Value: TAppMessageItemStyle); begin FInputStyle.Assign(Value); end;
 
-function TModernDialogs.GetTranslation: TDialogTranslation; begin Result := TRANSLATIONS[FLanguage]; end;
+function TModernDialogs.GetTranslation: TDialogTranslation;
+var
+  BaseLanguage: TDialogLanguage;
+begin
+  BaseLanguage := FCustomBaseLanguage;
+  if BaseLanguage = dlCustom then
+    BaseLanguage := dlEnglish;
+
+  if FLanguage <> dlCustom then
+    Result := TRANSLATIONS[FLanguage]
+  else
+  begin
+    { Custom fields are an overlay: empty fields inherit the selected base. }
+    Result := TRANSLATIONS[BaseLanguage];
+    if Assigned(FCustomTranslation) then
+    begin
+      if FCustomTranslation.TitleInfo <> '' then Result.TitleInfo := FCustomTranslation.TitleInfo;
+      if FCustomTranslation.TitleSuccess <> '' then Result.TitleSuccess := FCustomTranslation.TitleSuccess;
+      if FCustomTranslation.TitleWarning <> '' then Result.TitleWarning := FCustomTranslation.TitleWarning;
+      if FCustomTranslation.TitleError <> '' then Result.TitleError := FCustomTranslation.TitleError;
+      if FCustomTranslation.TitleConfirm <> '' then Result.TitleConfirm := FCustomTranslation.TitleConfirm;
+      if FCustomTranslation.TitleNotify <> '' then Result.TitleNotify := FCustomTranslation.TitleNotify;
+      if FCustomTranslation.TitleInput <> '' then Result.TitleInput := FCustomTranslation.TitleInput;
+      if FCustomTranslation.BtnOk <> '' then Result.BtnOk := FCustomTranslation.BtnOk;
+      if FCustomTranslation.BtnClose <> '' then Result.BtnClose := FCustomTranslation.BtnClose;
+      if FCustomTranslation.BtnYes <> '' then Result.BtnYes := FCustomTranslation.BtnYes;
+      if FCustomTranslation.BtnNo <> '' then Result.BtnNo := FCustomTranslation.BtnNo;
+      if FCustomTranslation.BtnCancel <> '' then Result.BtnCancel := FCustomTranslation.BtnCancel;
+      if (FCustomTranslation.CountdownFmt <> '') and
+         IsValidCountdownFormat(FCustomTranslation.CountdownFmt) then
+        Result.CountdownFmt := FCustomTranslation.CountdownFmt;
+    end;
+  end;
+
+  { This is the effective direction, including an explicit override. }
+  Result.BiDiMode := FBiDiMode;
+end;
 
 function TModernDialogs.GetStyle(AType: TAppMessageType): TAppMessageItemStyle;
 begin
@@ -440,7 +582,7 @@ begin
   Result := Ask(LTitle, Msg, mtQuestion, [T.BtnYes, T.BtnNo], Idx) = 0;
 end;
 
-function TModernDialogs.InputBox(const ATitle, APrompt: string; const ADefault: string = ''): string;
+function TModernDialogs.InputBox(const ATitle, APrompt: string; const ADefault: string): string;
 var frm: TfrmModernDialog; LOwner: TComponent; LTitle: string; T: TDialogTranslation;
 begin
   T := GetTranslation;
@@ -452,6 +594,31 @@ begin
     Result := frm.InputResult;
   finally
     frm.Free;
+  end;
+end;
+
+function TModernDialogs.TryInputBox(const ATitle, APrompt: string; var AValue: string): Boolean;
+var
+  Frm: TfrmModernDialog;
+  LOwner: TComponent;
+  LTitle: string;
+  T: TDialogTranslation;
+  DialogResult: Integer;
+begin
+  T := GetTranslation;
+  if ATitle = '' then LTitle := T.TitleInput else LTitle := ATitle;
+  if Assigned(Screen) and Assigned(Screen.ActiveForm) then LOwner := Screen.ActiveForm else LOwner := Application;
+  Frm := TfrmModernDialog.CreateCustom(LOwner, Self);
+  try
+    { Execute returns button index 0 for Yes/OK and 1 for Cancel,
+      including Escape and a window-close cancellation. }
+    DialogResult := Frm.Execute(mtInput, LTitle, APrompt, [T.BtnYes, T.BtnCancel],
+      0, 0, True, AValue);
+    Result := DialogResult = 0;
+    if Result then
+      AValue := Frm.InputResult;
+  finally
+    Frm.Free;
   end;
 end;
 
@@ -568,7 +735,11 @@ procedure TFlatButton.DoEnter; begin inherited; Invalidate; end;
 procedure TFlatButton.DoExit; begin inherited; FIsPressed := False; Invalidate; end;
 
 procedure TFlatButton.Paint;
-var R: TRect; BGColor, BorderColor, TextColor: TColor; IsActive: Boolean;
+var
+  R: TRect;
+  BGColor, BorderColor, TextColor: TColor;
+  IsActive: Boolean;
+  DrawFlags: Cardinal;
 begin
   R := ClientRect;
   IsActive := FIsHovered or Focused;
@@ -586,7 +757,10 @@ begin
   Canvas.Brush.Style := bsClear;
   Canvas.Font.Assign(FBtnFont);
   Canvas.Font.Color := TextColor;
-  DrawText(Canvas.Handle, PChar(FCaption), Length(FCaption), R, DT_CENTER or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX);
+  DrawFlags := DT_CENTER or DT_VCENTER or DT_SINGLELINE or DT_NOPREFIX;
+  if BiDiMode <> bdLeftToRight then
+    DrawFlags := DrawFlags or DT_RTLREADING;
+  DrawText(Canvas.Handle, PChar(FCaption), Length(FCaption), R, DrawFlags);
 end;
 
 { TModernInputEdit }
@@ -648,6 +822,7 @@ begin
   Font.Assign(FComponent.Font);
   KeyPreview := True;
   FIsInput := False;
+  FIsToast := False;
   FInputResult := '';
   BiDiMode := bdLeftToRight;
   ParentBiDiMode := False;
@@ -805,7 +980,15 @@ end;
 
 procedure TfrmModernDialog.BuildUI;
 begin
-  FIsRTL := (FComponent.BiDiMode = bdRightToLeft);
+  FIsRTL := FComponent.BiDiMode in
+    [bdRightToLeft, bdRightToLeftNoAlign, bdRightToLeftReadingOnly];
+
+  { Keep the form and its coordinate system LTR.  The dialog places the
+    accent bar, badge, message, edit and buttons explicitly below.  Setting
+    the form itself to bdRightToLeft would mirror Align/Left a second time
+    and undo those manual RTL coordinates. }
+  BiDiMode := bdLeftToRight;
+  ParentBiDiMode := False;
 
   FAccentBar := TPanel.Create(Self);
   FAccentBar.Parent := Self;
@@ -847,12 +1030,19 @@ begin
 
   pbBadge := TPaintBox.Create(Self);
   pbBadge.Parent := pnlHeader;
+  pbBadge.BiDiMode := bdLeftToRight;
   pbBadge.Width := DefaultBadgeRadius + 16;
-  pbBadge.Align := alLeft;
+  { This is a manual mirror; the form is deliberately not native-RTL. }
+  { Deliberately place the icon opposite the message's reading side:
+    RTL icons are on the left; LTR icons are on the right. }
+  if FIsRTL then pbBadge.Align := alLeft else pbBadge.Align := alRight;
   pbBadge.OnPaint := DrawBadge;
 
   lblTitle := TLabel.Create(Self);
   lblTitle.Parent := pnlHeader;
+  lblTitle.ParentBiDiMode := False;
+  if FIsRTL then lblTitle.BiDiMode := bdRightToLeftReadingOnly
+  else lblTitle.BiDiMode := bdLeftToRight;
   lblTitle.Align := alClient;
   lblTitle.AlignWithMargins := True;
   lblTitle.Font.Assign(Font);
@@ -863,16 +1053,21 @@ begin
   if FIsRTL then
   begin
     lblTitle.Alignment := taRightJustify;
-    lblTitle.Margins.SetBounds(0, 0, 10, 0);
+    { RTL icon is on the left, so reserve space on the left. }
+    lblTitle.Margins.SetBounds(10, 0, 0, 0);
   end
   else
   begin
     lblTitle.Alignment := taLeftJustify;
-    lblTitle.Margins.SetBounds(10, 0, 0, 0);
+    { LTR icon is on the right, so reserve space on the right. }
+    lblTitle.Margins.SetBounds(0, 0, 10, 0);
   end;
 
   lblMessage := TLabel.Create(Self);
   lblMessage.Parent := pnlClient;
+  lblMessage.ParentBiDiMode := False;
+  if FIsRTL then lblMessage.BiDiMode := bdRightToLeftReadingOnly
+  else lblMessage.BiDiMode := bdLeftToRight;
   lblMessage.AlignWithMargins := True;
   lblMessage.WordWrap := True;
   lblMessage.AutoSize := False;
@@ -915,6 +1110,9 @@ procedure TfrmModernDialog.BuildNotificationUI;
 begin
   lblCountdown := TLabel.Create(Self);
   lblCountdown.Parent := pnlClient;
+  lblCountdown.ParentBiDiMode := False;
+  if FIsRTL then lblCountdown.BiDiMode := bdRightToLeftReadingOnly
+  else lblCountdown.BiDiMode := bdLeftToRight;
   lblCountdown.Align := alBottom;
   lblCountdown.Height := 20;
   if FIsRTL then lblCountdown.Alignment := taRightJustify else lblCountdown.Alignment := taLeftJustify;
@@ -922,6 +1120,8 @@ begin
   lblCountdown.Font.Assign(Font);
   lblCountdown.Font.Size := Font.Size - 1;
   lblCountdown.Font.Color := TColor(COLOR_TEXT_COUNTDOWN);
+  FLastSec := Ceil(FTotalMs / 1000.0);
+  lblCountdown.Caption := Format(FComponent.GetTranslation.CountdownFmt, [FLastSec]);
 
   pnlProgressTrack := TPanel.Create(Self);
   pnlProgressTrack.Parent := Self;
@@ -940,7 +1140,10 @@ begin
 end;
 
 procedure TfrmModernDialog.DrawBadge(Sender: TObject);
-var CX, CY, R: Integer; TR: TRect;
+var
+  CX, CY, R: Integer;
+  TR: TRect;
+  DrawFlags: Cardinal;
 begin
   CX := pbBadge.Width div 2;
   CY := pbBadge.Height div 2;
@@ -956,14 +1159,29 @@ begin
   pbBadge.Canvas.Font.Style := [fsBold];
   pbBadge.Canvas.Font.Color := FStyle.IconColor;
   TR := Rect(CX - R, CY - R, CX + R, CY + R);
-  DrawText(pbBadge.Canvas.Handle, PChar(FStyle.IconChar), Length(FStyle.IconChar), TR, DT_CENTER or DT_VCENTER or DT_SINGLELINE);
+  DrawFlags := DT_CENTER or DT_VCENTER or DT_SINGLELINE;
+  if FIsRTL then
+    DrawFlags := DrawFlags or DT_RTLREADING;
+  DrawText(pbBadge.Canvas.Handle, PChar(FStyle.IconChar), Length(FStyle.IconChar), TR, DrawFlags);
 end;
 
 procedure TfrmModernDialog.ApplyStyle(AMsgType: TAppMessageType);
 begin
   FStyle := FComponent.GetStyle(AMsgType);
   FAccentBar.Color := FStyle.AccentColor;
-  if Assigned(pbBadge) then pbBadge.Invalidate;
+  if Assigned(pbBadge) then
+  begin
+    { An empty IconChar means no icon: hide the badge and release its
+      reserved header space so the title cannot overlap or look offset. }
+    pbBadge.Visible := Trim(FStyle.IconChar) <> '';
+    if not pbBadge.Visible then
+      lblTitle.Margins.SetBounds(0, 0, 0, 0)
+    else if FIsRTL then
+      lblTitle.Margins.SetBounds(10, 0, 0, 0)
+    else
+      lblTitle.Margins.SetBounds(0, 0, 10, 0);
+    pbBadge.Invalidate;
+  end;
 end;
 
 procedure TfrmModernDialog.CreateButtons(const Buttons: array of string; ADefaultIndex: Integer; out DefaultBtn: TFlatButton);
@@ -971,6 +1189,9 @@ var i, TotalWidth: Integer; Btn: TFlatButton;
 begin
   FBtnCount := Length(Buttons);
   SetLength(FButtons, FBtnCount);
+  DefaultBtn := nil;
+  if FBtnCount = 0 then
+    Exit;
   TotalWidth := FBtnCount * (BtnWidth + BtnSpacing) - BtnSpacing;
 
   pnlBtnContainer := TPanel.Create(Self);
@@ -986,6 +1207,9 @@ begin
   begin
     Btn := TFlatButton.CreateStyled(Self, Buttons[i], FStyle.AccentColor, Font);
     Btn.Parent := pnlBtnContainer;
+    Btn.ParentBiDiMode := False;
+    if FIsRTL then Btn.BiDiMode := bdRightToLeftReadingOnly
+    else Btn.BiDiMode := bdLeftToRight;
     Btn.SetBounds(0, 0, BtnWidth, BtnHeight);
     Btn.Tag2 := i;
     Btn.TabOrder := i;
@@ -1014,31 +1238,52 @@ begin
 end;
 
 procedure TfrmModernDialog.TimerTick(Sender: TObject);
+var SecLeft: Integer;
 begin
-  if Assigned(FTimer) then
-    FTimer.Enabled := False;
-
-  // اگر Toast است (فوتر مخفی) → ببند و آزاد کن
-  if not pnlFooter.Visible then
+  { Toasts are modeless and use one timer interval equal to their lifetime.
+    Notifications are modal and need periodic ticks for the countdown. }
+  if FIsToast then
   begin
+    if Assigned(FTimer) then FTimer.Enabled := False;
     Close;
-    Release;          // مهم
-  end
-  else
-  begin
-    // حالت Notification معمولی
-    ModalResult := mrOk;
+    Release;
+    Exit;
   end;
+
+  if FTotalMs <= 0 then
+  begin
+    ModalResult := mrOk;
+    Exit;
+  end;
+
+  FElapsedMs := Min(FTotalMs, FElapsedMs + FTimer.Interval);
+  if Assigned(pnlProgressFill) and Assigned(pnlProgressTrack) then
+    pnlProgressFill.Width := Round(pnlProgressTrack.Width *
+      ((FTotalMs - FElapsedMs) / Max(FTotalMs, 1)));
+
+  SecLeft := Ceil((FTotalMs - FElapsedMs) / 1000.0);
+  if (SecLeft <> FLastSec) and Assigned(lblCountdown) then
+  begin
+    FLastSec := SecLeft;
+    lblCountdown.Caption := Format(FComponent.GetTranslation.CountdownFmt, [SecLeft]);
+  end;
+
+  if FElapsedMs >= FTotalMs then
+    ModalResult := mrOk
+  else if Assigned(FTimer) then
+    FTimer.Enabled := True;
 end;
 
 function TfrmModernDialog.Execute(AMsgType: TAppMessageType; const ATitle, AMessage: string;
-  Buttons: array of string; TimeoutMs: Integer = 0; ADefaultButtonIndex: Integer = 0;
-  AIsInput: Boolean = False; const ADefaultText: string = ''): Integer;
+  Buttons: array of string; TimeoutMs: Integer; ADefaultButtonIndex: Integer;
+  AIsInput: Boolean; const ADefaultText: string): Integer;
 var
   AvailWidth, MsgHeight, ContentHeight, BottomAreaHeight: Integer;
+  TitleHeight: Integer;
   InitialFocusBtn: TFlatButton;
   LDefaultIndex: Integer;
 begin
+  FIsToast := False;
   FIsInput := AIsInput;
   FInputResult := '';
 
@@ -1048,8 +1293,23 @@ begin
   lblTitle.Caption := ATitle;
   lblMessage.Caption := AMessage;
 
-  AvailWidth := Width - FAccentBar.Width - pnlClient.Padding.Left - pnlClient.Padding.Right - 28;
-  MsgHeight := CalcTextHeight(Canvas, AMessage, AvailWidth, lblMessage.Font);
+  { Use the actual client width after alignment, including label margins. }
+  pnlClient.Realign;
+  pnlHeader.Realign;
+  AvailWidth := pnlClient.ClientWidth - pnlClient.Padding.Left -
+    pnlClient.Padding.Right - lblMessage.Margins.Left - lblMessage.Margins.Right;
+  AvailWidth := Max(1, AvailWidth);
+  lblMessage.Align := alNone;
+  lblMessage.AutoSize := False;
+  lblMessage.Width := AvailWidth;
+  { Extra vertical breathing room is intentional: DrawText reports glyph
+    bounds, while TLabel's paint path also needs top/bottom inset. }
+  MsgHeight := CalcTextHeight(Canvas, AMessage, AvailWidth, lblMessage.Font, FIsRTL) + 8;
+
+  TitleHeight := CalcTextHeight(Canvas, ATitle, Max(1, lblTitle.ClientWidth),
+    lblTitle.Font, FIsRTL) + 12;
+  pnlHeader.Height := Max(HeaderRowHeight, TitleHeight);
+  pnlHeader.Realign;
 
   if FIsInput then
   begin
@@ -1060,7 +1320,7 @@ begin
                         - lblMessage.Margins.Left - lblMessage.Margins.Right;
     lblMessage.Height := MsgHeight;
     lblMessage.Left := pnlClient.Padding.Left + lblMessage.Margins.Left;
-    lblMessage.Top := HeaderRowHeight + 4;
+    lblMessage.Top := pnlHeader.Height + 4;
 
     edInput.Visible := True;
     edInput.Align := alNone;
@@ -1078,7 +1338,7 @@ begin
     edInput.Invalidate;
     edInput.Update;
 
-    ContentHeight := HeaderRowHeight + 4 + MsgHeight + 8 + edInput.Height + 10;
+    ContentHeight := pnlHeader.Height + 4 + MsgHeight + 8 + edInput.Height + 10;
   end
   else
   begin
@@ -1091,9 +1351,9 @@ begin
                         - lblMessage.Margins.Left - lblMessage.Margins.Right;
     lblMessage.Height := MsgHeight;
     lblMessage.Left := pnlClient.Padding.Left + lblMessage.Margins.Left;
-    lblMessage.Top := HeaderRowHeight + 4;
+    lblMessage.Top := pnlHeader.Height + 4;
 
-    ContentHeight := HeaderRowHeight + 4 + MsgHeight + 10;
+    ContentHeight := pnlHeader.Height + 4 + MsgHeight + 10;
   end;
 
   InitialFocusBtn := nil;
@@ -1101,11 +1361,11 @@ begin
   if TimeoutMs > 0 then
   begin
     pnlFooter.Visible := False;
-    BuildNotificationUI;
-    BottomAreaHeight := 28;
     FTotalMs := TimeoutMs;
     FElapsedMs := 0;
     FLastSec := Ceil(TimeoutMs / 1000.0) + 1;
+    BuildNotificationUI;
+    BottomAreaHeight := 28;
     FTimer := TTimer.Create(Self);
     FTimer.Interval := 50;
     FTimer.OnTimer := TimerTick;
@@ -1155,12 +1415,16 @@ begin
 
   if TimeoutMs > 0 then
     Result := 0
-  else if ModalResult = mrCancel then
+  else if (ModalResult = mrCancel) or (ModalResult = mrNone) then
     Result := Max(0, High(Buttons))
+  else if ModalResult >= 100 then
+    Result := ModalResult - 100
   else
-    Result := ModalResult - 100;
+    { Defensive fallback for a close path that reports an unexpected modal
+      result: treat it as cancellation rather than a negative button index. }
+    Result := Max(0, High(Buttons));
 end;
-procedure TModernDialogs.ShowToast(const Msg: string; AType: TAppMessageType = mtSuccess; TimeoutMs: Integer = 3000);
+procedure TModernDialogs.ShowToast(const Msg: string; AType: TAppMessageType; TimeoutMs: Integer);
 var
   frm: TfrmModernDialog;
   LOwner: TComponent;
@@ -1173,10 +1437,11 @@ begin
   frm := TfrmModernDialog.CreateCustom(LOwner, Self);
   frm.ExecuteToast(AType, Msg, TimeoutMs);
 end;
-procedure TfrmModernDialog.ExecuteToast(AMsgType: TAppMessageType; const AMessage: string; TimeoutMs: Integer = 3000);
+procedure TfrmModernDialog.ExecuteToast(AMsgType: TAppMessageType; const AMessage: string; TimeoutMs: Integer);
 var
   OwnerForm: TCustomForm;
 begin
+  FIsToast := True;
   FIsInput := False;
   BorderStyle := bsNone;
   FormStyle := fsStayOnTop;
@@ -1218,7 +1483,7 @@ begin
   if OwnerForm <> nil then
   begin
     // بالا سمت راست فرم والد
-    if FComponent.BiDiMode = bdRightToLeft then
+    if FIsRTL then
       Left := OwnerForm.Left + 6
     else
       Left := OwnerForm.Left + OwnerForm.Width - Width - 6;
@@ -1228,7 +1493,7 @@ begin
   else
   begin
     // fallback
-    if FComponent.BiDiMode = bdRightToLeft then
+    if FIsRTL then
       Left := Screen.WorkAreaRect.Left + 6
     else
       Left := Screen.WorkAreaRect.Right - Width - 6;
@@ -1237,11 +1502,11 @@ begin
 
   ApplyRoundAndShadow;
 
-  FTotalMs   := TimeoutMs;
+  FTotalMs   := Max(1, TimeoutMs);
   FElapsedMs := 0;
 
   FTimer := TTimer.Create(Self);
-  FTimer.Interval := TimeoutMs;
+  FTimer.Interval := FTotalMs;
   FTimer.OnTimer := TimerTick;
   FTimer.Enabled := True;
 
