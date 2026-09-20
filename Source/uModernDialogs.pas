@@ -217,6 +217,11 @@ type
     FBtnCount: Integer;
     FIsRTL, FIsInput, FIsToast: Boolean;
     FInputResult: string;
+    { Toasts outlive the component/form that requested them.  Once the
+      toast has built its controls, this snapshot replaces FStyle and the
+      component pointer is cleared so later paint/timer callbacks cannot
+      dereference destroyed component-owned objects. }
+    FOwnedToastStyle: TAppMessageItemStyle;
 
     procedure BuildUI;
     procedure BuildNotificationUI;
@@ -226,6 +231,7 @@ type
     procedure CenterButtons;
     procedure ButtonClick(Sender: TObject);
     procedure TimerTick(Sender: TObject);
+    procedure ToastTimerTick(Sender: TObject);
     procedure ApplyRoundAndShadow;
     procedure ApplyNativeShadow;
     procedure FormPaint(Sender: TObject);
@@ -281,19 +287,31 @@ begin
   Result := TColor(RGB(EnsureRange(NewR, 0, 255), EnsureRange(NewG, 0, 255), EnsureRange(NewB, 0, 255)));
 end;
 
+function NormalizeLineBreaks(const S: string): string;
+begin
+  { DrawText treats CRLF consistently; normalize lone LF/CR so explicit
+    line breaks are measured exactly as they are painted by TLabel. }
+  Result := StringReplace(S, #13#10, #10, [rfReplaceAll]);
+  Result := StringReplace(Result, #13, #10, [rfReplaceAll]);
+  Result := StringReplace(Result, #10, #13#10, [rfReplaceAll]);
+end;
+
 function CalcTextHeight(ACanvas: TCanvas; const AText: string; AWidth: Integer;
   AFont: TFont; AIsRTL: Boolean): Integer;
 var
   R: TRect;
   DrawFlags: Cardinal;
+  LText: string;
 begin
   ACanvas.Font.Assign(AFont);
-  { Use the actual target font and never pass a zero wrapping width. }
+  LText := NormalizeLineBreaks(AText);
+  { Measure with the exact control width and the same word-break/prefix rules
+    used by the label. DT_EDITCONTROL preserves empty explicit lines. }
   R := Rect(0, 0, Max(1, AWidth), 0);
-  DrawFlags := DT_CALCRECT or DT_WORDBREAK or DT_NOPREFIX;
+  DrawFlags := DT_CALCRECT or DT_WORDBREAK or DT_EDITCONTROL or DT_NOPREFIX;
   if AIsRTL then
     DrawFlags := DrawFlags or DT_RTLREADING;
-  DrawText(ACanvas.Handle, PChar(AText), Length(AText), R, DrawFlags);
+  DrawText(ACanvas.Handle, PChar(LText), Length(LText), R, DrawFlags);
   Result := Max(18, R.Bottom - R.Top);
 end;
 
@@ -640,6 +658,7 @@ end;
 constructor TFlatButton.CreateStyled(AOwner: TComponent; const ACaption: string; AAccent: TColor; AFont: TFont);
 begin
   inherited Create(AOwner);
+  StyleElements := [];
   FAccentColor := AAccent;
   FIsHovered := False;
   FIsPressed := False;
@@ -814,6 +833,10 @@ begin
   inherited CreateNew(AOwner);
   FComponent := AComp;
   BorderStyle := bsNone;
+  { VCL style independence: DevExpress skin exclusion is handled by the
+    documented OnSkinForm/TdxSkinIgnoredFormList integration (see the guide
+    shipped with this unit); StyleElements alone cannot disable dxSkinsForm. }
+  StyleElements := [];
   Position := poDesigned;
   Width := 400;
   Height := 200;
@@ -846,7 +869,22 @@ end;
 
 destructor TfrmModernDialog.Destroy;
 begin
+  { A timer is owned by this form. Stop it and detach its event first so
+    both modal dialogs and synchronous toasts have deterministic cleanup. }
+  if Assigned(FTimer) then
+  begin
+    FTimer.Enabled := False;
+    FTimer.OnTimer := nil;
+  end;
+  FTimer := nil;
+
+  { Keep FOwnedToastStyle valid through inherited window/control teardown.
+    Paint callbacks must never see a freed style. }
+  FComponent := nil;
   inherited;
+  FStyle := nil;
+  FOwnedToastStyle.Free;
+  FOwnedToastStyle := nil;
 end;
 
 procedure TfrmModernDialog.ApplyNativeShadow;
@@ -992,6 +1030,7 @@ begin
 
   FAccentBar := TPanel.Create(Self);
   FAccentBar.Parent := Self;
+  FAccentBar.StyleElements := [];
   FAccentBar.Width := 6;
   FAccentBar.BevelOuter := bvNone;
   FAccentBar.ParentBackground := False;
@@ -999,6 +1038,7 @@ begin
 
   pnlClient := TPanel.Create(Self);
   pnlClient.Parent := Self;
+  pnlClient.StyleElements := [];
   pnlClient.Align := alClient;
   pnlClient.BevelOuter := bvNone;
   pnlClient.Color := FComponent.BackgroundColor;
@@ -1007,6 +1047,7 @@ begin
 
   pnlFooter := TPanel.Create(Self);
   pnlFooter.Parent := Self;
+  pnlFooter.StyleElements := [];
   pnlFooter.Align := alBottom;
   pnlFooter.Height := 52;
   pnlFooter.BevelOuter := bvNone;
@@ -1015,6 +1056,7 @@ begin
 
   pnlButtons := TPanel.Create(Self);
   pnlButtons.Parent := pnlFooter;
+  pnlButtons.StyleElements := [];
   pnlButtons.Align := alClient;
   pnlButtons.BevelOuter := bvNone;
   pnlButtons.Color := pnlFooter.Color;
@@ -1022,6 +1064,7 @@ begin
 
   pnlHeader := TPanel.Create(Self);
   pnlHeader.Parent := pnlClient;
+  pnlHeader.StyleElements := [];
   pnlHeader.Align := alTop;
   pnlHeader.Height := HeaderRowHeight;
   pnlHeader.BevelOuter := bvNone;
@@ -1030,6 +1073,7 @@ begin
 
   pbBadge := TPaintBox.Create(Self);
   pbBadge.Parent := pnlHeader;
+  pbBadge.StyleElements := [];
   pbBadge.BiDiMode := bdLeftToRight;
   pbBadge.Width := DefaultBadgeRadius + 16;
   { This is a manual mirror; the form is deliberately not native-RTL. }
@@ -1040,6 +1084,7 @@ begin
 
   lblTitle := TLabel.Create(Self);
   lblTitle.Parent := pnlHeader;
+  lblTitle.StyleElements := [];
   lblTitle.ParentBiDiMode := False;
   if FIsRTL then lblTitle.BiDiMode := bdRightToLeftReadingOnly
   else lblTitle.BiDiMode := bdLeftToRight;
@@ -1065,6 +1110,7 @@ begin
 
   lblMessage := TLabel.Create(Self);
   lblMessage.Parent := pnlClient;
+  lblMessage.StyleElements := [];
   lblMessage.ParentBiDiMode := False;
   if FIsRTL then lblMessage.BiDiMode := bdRightToLeftReadingOnly
   else lblMessage.BiDiMode := bdLeftToRight;
@@ -1110,6 +1156,7 @@ procedure TfrmModernDialog.BuildNotificationUI;
 begin
   lblCountdown := TLabel.Create(Self);
   lblCountdown.Parent := pnlClient;
+  lblCountdown.StyleElements := [];
   lblCountdown.ParentBiDiMode := False;
   if FIsRTL then lblCountdown.BiDiMode := bdRightToLeftReadingOnly
   else lblCountdown.BiDiMode := bdLeftToRight;
@@ -1125,6 +1172,7 @@ begin
 
   pnlProgressTrack := TPanel.Create(Self);
   pnlProgressTrack.Parent := Self;
+  pnlProgressTrack.StyleElements := [];
   pnlProgressTrack.Align := alBottom;
   pnlProgressTrack.Height := 4;
   pnlProgressTrack.BevelOuter := bvNone;
@@ -1133,6 +1181,7 @@ begin
 
   pnlProgressFill := TPanel.Create(Self);
   pnlProgressFill.Parent := pnlProgressTrack;
+  pnlProgressFill.StyleElements := [];
   pnlProgressFill.BevelOuter := bvNone;
   pnlProgressFill.ParentBackground := False;
   pnlProgressFill.Color := FStyle.AccentColor;
@@ -1196,6 +1245,7 @@ begin
 
   pnlBtnContainer := TPanel.Create(Self);
   pnlBtnContainer.Parent := pnlButtons;
+  pnlBtnContainer.StyleElements := [];
   pnlBtnContainer.BevelOuter := bvNone;
   pnlBtnContainer.Width := TotalWidth;
   pnlBtnContainer.Height := BtnHeight;
@@ -1206,6 +1256,7 @@ begin
   for i := 0 to High(Buttons) do
   begin
     Btn := TFlatButton.CreateStyled(Self, Buttons[i], FStyle.AccentColor, Font);
+    Btn.StyleElements := [];
     Btn.Parent := pnlBtnContainer;
     Btn.ParentBiDiMode := False;
     if FIsRTL then Btn.BiDiMode := bdRightToLeftReadingOnly
@@ -1238,20 +1289,21 @@ begin
 end;
 
 procedure TfrmModernDialog.TimerTick(Sender: TObject);
-var SecLeft: Integer;
+var
+  SecLeft: Integer;
 begin
-  { Toasts are modeless and use one timer interval equal to their lifetime.
-    Notifications are modal and need periodic ticks for the countdown. }
-  if FIsToast then
-  begin
-    if Assigned(FTimer) then FTimer.Enabled := False;
-    Close;
-    Release;
+  { This handler is exclusively for a synchronous modal notification.  Toasts
+    have a separate callback so a modeless Release can never be confused with
+    setting ModalResult on a dialog that is waiting in ShowModal. }
+  if FIsToast or not Assigned(FTimer) then
     Exit;
-  end;
 
   if FTotalMs <= 0 then
   begin
+    { Non-positive modal timeouts mean manual dismissal: no timer is normally
+      installed, but keep this branch safe if a caller invokes the handler. }
+    FTimer.Enabled := False;
+    FTimer.OnTimer := nil;
     ModalResult := mrOk;
     Exit;
   end;
@@ -1262,16 +1314,34 @@ begin
       ((FTotalMs - FElapsedMs) / Max(FTotalMs, 1)));
 
   SecLeft := Ceil((FTotalMs - FElapsedMs) / 1000.0);
-  if (SecLeft <> FLastSec) and Assigned(lblCountdown) then
+  if (SecLeft <> FLastSec) and Assigned(lblCountdown) and Assigned(FComponent) then
   begin
     FLastSec := SecLeft;
     lblCountdown.Caption := Format(FComponent.GetTranslation.CountdownFmt, [SecLeft]);
   end;
 
   if FElapsedMs >= FTotalMs then
-    ModalResult := mrOk
-  else if Assigned(FTimer) then
-    FTimer.Enabled := True;
+  begin
+    { Disable before assigning ModalResult.  ShowModal returns synchronously
+      to Execute, which then performs the same defensive cleanup in its
+      finally block before the caller can close its own form. }
+    FTimer.Enabled := False;
+    FTimer.OnTimer := nil;
+    ModalResult := mrOk;
+  end;
+end;
+
+procedure TfrmModernDialog.ToastTimerTick(Sender: TObject);
+begin
+  { ShowToast is intentionally synchronous, just like ShowNotification.
+    The timer ends the modal loop; ownership and freeing are handled by
+    TModernDialogs.ShowToast after ExecuteToast returns. }
+  if not FIsToast or not Assigned(FTimer) then
+    Exit;
+
+  FTimer.Enabled := False;
+  FTimer.OnTimer := nil;
+  ModalResult := mrOk;
 end;
 
 function TfrmModernDialog.Execute(AMsgType: TAppMessageType; const ATitle, AMessage: string;
@@ -1286,12 +1356,18 @@ begin
   FIsToast := False;
   FIsInput := AIsInput;
   FInputResult := '';
+  { A non-positive modal timeout is deliberately an untimed dialog.  Reset
+    the timer state before building controls so no stale lifecycle state can
+    turn a manual notification into a modeless/released form. }
+  FTotalMs := 0;
+  FElapsedMs := 0;
+  FLastSec := 0;
 
   BuildUI;
   ApplyStyle(AMsgType);
 
-  lblTitle.Caption := ATitle;
-  lblMessage.Caption := AMessage;
+  lblTitle.Caption := NormalizeLineBreaks(ATitle);
+  lblMessage.Caption := NormalizeLineBreaks(AMessage);
 
   { Use the actual client width after alignment, including label margins. }
   pnlClient.Realign;
@@ -1306,6 +1382,7 @@ begin
     bounds, while TLabel's paint path also needs top/bottom inset. }
   MsgHeight := CalcTextHeight(Canvas, AMessage, AvailWidth, lblMessage.Font, FIsRTL) + 8;
 
+  pnlHeader.Realign;
   TitleHeight := CalcTextHeight(Canvas, ATitle, Max(1, lblTitle.ClientWidth),
     lblTitle.Font, FIsRTL) + 12;
   pnlHeader.Height := Max(HeaderRowHeight, TitleHeight);
@@ -1320,7 +1397,11 @@ begin
                         - lblMessage.Margins.Left - lblMessage.Margins.Right;
     lblMessage.Height := MsgHeight;
     lblMessage.Left := pnlClient.Padding.Left + lblMessage.Margins.Left;
-    lblMessage.Top := pnlHeader.Height + 4;
+    { pnlHeader is a windowed control that starts below pnlClient.Padding.Top.
+      A windowed sibling always paints above a TLabel (graphic control), so the
+      label must start below the header's real bottom edge; otherwise the header
+      panel covers the top of the message glyphs (e.g. the Persian question mark). }
+    lblMessage.Top := pnlHeader.Top + pnlHeader.Height + 4;
 
     edInput.Visible := True;
     edInput.Align := alNone;
@@ -1351,7 +1432,11 @@ begin
                         - lblMessage.Margins.Left - lblMessage.Margins.Right;
     lblMessage.Height := MsgHeight;
     lblMessage.Left := pnlClient.Padding.Left + lblMessage.Margins.Left;
-    lblMessage.Top := pnlHeader.Height + 4;
+    { pnlHeader is a windowed control that starts below pnlClient.Padding.Top.
+      A windowed sibling always paints above a TLabel (graphic control), so the
+      label must start below the header's real bottom edge; otherwise the header
+      panel covers the top of the message glyphs (e.g. the Persian question mark). }
+    lblMessage.Top := pnlHeader.Top + pnlHeader.Height + 4;
 
     ContentHeight := pnlHeader.Height + 4 + MsgHeight + 10;
   end;
@@ -1380,6 +1465,10 @@ begin
 
   // ارتفاع کاملاً خودکار
   Height := ContentHeight + BottomAreaHeight + pnlClient.Padding.Top + pnlClient.Padding.Bottom;
+  { Do not let unusually long content place the window outside the monitor.
+    No scrolling is implied; the existing fixed-width dialog remains the
+    bounded presentation surface. }
+  Height := Min(Height, Max(1, Screen.WorkAreaRect.Bottom - Screen.WorkAreaRect.Top - 16));
 
   if Assigned(Screen.ActiveForm) and (Screen.ActiveForm <> Self) then
   begin
@@ -1403,7 +1492,22 @@ begin
   else if Assigned(InitialFocusBtn) then
     ActiveControl := InitialFocusBtn;
 
-  ShowModal;
+  try
+    { ShowModal is intentional here: the caller remains blocked until the
+      notification timer assigns ModalResult or the user manually dismisses
+      the form.  In particular, the caller's subsequent Form2.Close cannot
+      run while this modal loop is active. }
+    ShowModal;
+  finally
+    { Manual dismissal, exceptions, and timer completion all pass through the
+      same timer shutdown path.  The timer remains owned by Self and is freed
+      exactly once by the form destructor. }
+    if Assigned(FTimer) then
+    begin
+      FTimer.Enabled := False;
+      FTimer.OnTimer := nil;
+    end;
+  end;
 
   if FIsInput then
   begin
@@ -1426,16 +1530,17 @@ begin
 end;
 procedure TModernDialogs.ShowToast(const Msg: string; AType: TAppMessageType; TimeoutMs: Integer);
 var
-  frm: TfrmModernDialog;
-  LOwner: TComponent;
+  Frm: TfrmModernDialog;
 begin
-  if Assigned(Screen.ActiveForm) then
-    LOwner := Screen.ActiveForm
-  else
-    LOwner := Application;
-
-  frm := TfrmModernDialog.CreateCustom(LOwner, Self);
-  frm.ExecuteToast(AType, Msg, TimeoutMs);
+  { ShowToast is synchronous by design.  The caller remains blocked until
+    the toast timeout expires or the toast is otherwise dismissed.  The form
+    is therefore owned locally and is freed after ExecuteToast returns. }
+  Frm := TfrmModernDialog.CreateCustom(nil, Self);
+  try
+    Frm.ExecuteToast(AType, Msg, TimeoutMs);
+  finally
+    Frm.Free;
+  end;
 end;
 procedure TfrmModernDialog.ExecuteToast(AMsgType: TAppMessageType; const AMessage: string; TimeoutMs: Integer);
 var
@@ -1444,31 +1549,65 @@ begin
   FIsToast := True;
   FIsInput := False;
   BorderStyle := bsNone;
+  StyleElements := [];
   FormStyle := fsStayOnTop;
+  { Do not retain the caller form as a popup parent.  A destroyed popup
+    parent can otherwise hide/destroy a modeless toast even when its Owner is
+    Application. }
+  PopupParent := nil;
+  PopupMode := pmNone;
   Position := poDesigned;
   KeyPreview := True;
 
   BuildUI;
   ApplyStyle(AMsgType);
 
-  // --- چیدمان یک‌خطی (آیکن + متن) ---
-  pnlHeader.Align := alClient;
-  pnlHeader.Height := 52;
+  { Everything below this point is modeless.  Copy the selected style before
+    detaching from the component so DrawBadge/FormPaint remain valid if the
+    component (or its owner form) is destroyed immediately after this call. }
+  FOwnedToastStyle.Free;
+  FOwnedToastStyle := TAppMessageItemStyle.Create;
+  FOwnedToastStyle.Assign(FStyle);
+  FStyle := FOwnedToastStyle;
+  FComponent := nil;
 
-  lblTitle.Caption := AMessage;
+  { Toasts use the same measured label path as dialogs, including explicit
+    line breaks and wrapping. Keep the established width and icon placement. }
+  pnlHeader.Align := alTop;
+  lblTitle.Caption := NormalizeLineBreaks(AMessage);
   lblTitle.Visible := True;
   lblTitle.Font.Size := Font.Size;
   lblTitle.Font.Style := [];
   lblTitle.Font.Color := TColor(COLOR_TEXT_MSG);
-  lblTitle.Layout := tlCenter;
+  lblTitle.Layout := tlTop;
   lblTitle.AutoSize := False;
-
   lblMessage.Visible := False;
-
   pnlFooter.Visible := False;
-
-  Width  := 340;
-  Height := 56;
+  Width := 340;
+  pnlClient.Realign;
+  pnlHeader.Realign;
+  lblTitle.Align := alNone;
+  if pbBadge.Visible then
+  begin
+    lblTitle.Width := Max(1, pnlHeader.ClientWidth - pbBadge.Width -
+      lblTitle.Margins.Left - lblTitle.Margins.Right);
+    if FIsRTL then
+      lblTitle.Left := pbBadge.Width + lblTitle.Margins.Left
+    else
+      lblTitle.Left := lblTitle.Margins.Left;
+  end
+  else
+  begin
+    lblTitle.Width := Max(1, pnlHeader.ClientWidth -
+      lblTitle.Margins.Left - lblTitle.Margins.Right);
+    lblTitle.Left := lblTitle.Margins.Left;
+  end;
+  lblTitle.Top := 4;
+  lblTitle.Height := CalcTextHeight(Canvas, lblTitle.Caption, lblTitle.Width,
+    lblTitle.Font, FIsRTL) + 8;
+  pnlHeader.Height := Max(HeaderRowHeight, lblTitle.Top + lblTitle.Height + 4);
+  Height := Min(pnlClient.Padding.Top + pnlHeader.Height + pnlClient.Padding.Bottom,
+    Max(1, Screen.WorkAreaRect.Bottom - Screen.WorkAreaRect.Top - 16));
 
   // ---------- موقعیت دقیق روی فرم والد ----------
   OwnerForm := nil;
@@ -1502,16 +1641,28 @@ begin
 
   ApplyRoundAndShadow;
 
+  { Toasts are synchronous in this version.  A non-positive timeout is
+    clamped to one millisecond so the modal loop always has a deterministic
+    timer completion instead of becoming an untimed window. }
   FTotalMs   := Max(1, TimeoutMs);
   FElapsedMs := 0;
 
   FTimer := TTimer.Create(Self);
   FTimer.Interval := FTotalMs;
-  FTimer.OnTimer := TimerTick;
+  FTimer.OnTimer := ToastTimerTick;
   FTimer.Enabled := True;
 
-  Show;
-  BringToFront;
+  try
+    { Use ShowModal so the caller cannot continue until ToastTimerTick sets
+      ModalResult.  This makes ShowToast behave like ShowNotification while
+      retaining the visual Toast presentation. }
+    ShowModal;
+  finally
+    if Assigned(FTimer) then
+    begin
+      FTimer.Enabled := False;
+      FTimer.OnTimer := nil;
+    end;
+  end;
 end;
 end.
-
